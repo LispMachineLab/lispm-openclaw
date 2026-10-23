@@ -121,7 +121,9 @@ them without waiting."
     (should (equal (plist-get props :key) "k"))
     (should (= (string-width (plist-get props :text-icon)) 1))
     (should-not (plist-get props :built-in))
-    (should-not (plist-get props :context))
+    (should (eq (plist-get props :context) #'lispm-openclaw--context))
+    (should (eq (plist-get props :deliver) #'lispm-openclaw--deliver))
+    (should (eq (plist-get props :answer) #'lispm-openclaw--answer-request))
     (should (file-readable-p (nth 1 (plist-get props :icon)))))
   (should (eq (alist-get 'openclaw lispm-agents--session-readers) #'lispm-openclaw--read-sessions))
   (should (memq #'lispm-openclaw--reread lispm-agents-reread-sessions-hook))
@@ -502,6 +504,143 @@ how to start it."
       '(("sessions.create" . (:err "Gateway call failed: Error: gateway timeout after 10000ms" :status 1)))
     (should (string-match-p "cannot be reached (gateway timeout after 10000ms): .openclaw gateway start. starts it"
                             (cadr (should-error (lispm-openclaw--create nil) :type 'user-error))))))
+
+;;;; Other agents' messages, and LispM's tools
+
+(defmacro lispm-openclaw-test-with-terminal (key &rest body)
+  "Run BODY with `terminal' a live terminal of the session KEY."
+  (declare (indent 1))
+  `(let ((terminal (generate-new-buffer "*openclaw:test*"))
+         (lispm-agents-terminal-live-p-function #'buffer-live-p))
+     (unwind-protect
+         (progn (with-current-buffer terminal (setq lispm-agents-buffer-session-id ,key))
+                ,@body)
+       (kill-buffer terminal))))
+
+(ert-deftest lispm-openclaw-test-reply-of ()
+  "A session's final reply to a message is the first answer after it that
+ends a run; till there is one, there is none.  The message is known by
+its idempotency key, or, where the Gateway keeps none, by its text."
+  (let* ((sent (list :role "user" :content "[Request R1 from codex]\n2+2?" :idempotencyKey "k1:user"))
+         (thinking (list :role "assistant" :stopReason "toolUse"
+                         :content (list (list :type "text" :text "Let me see.")
+                                        (list :type "toolCall" :name "exec"))))
+         (final (list :role "assistant" :stopReason "stop" :content (list (list :type "text" :text "4"))))
+         (later (list :role "assistant" :stopReason "stop" :content "Anything else?")))
+    (should-not (lispm-openclaw--reply-of (list :messages (list sent thinking)) "k1" "x"))
+    (should (equal (lispm-openclaw--reply-of (list :messages (list final sent thinking final later)) "k1" "x")
+                   "4"))
+    (should-not (lispm-openclaw--reply-of (list :messages (list sent final)) "k2" "x"))
+    (should (equal (lispm-openclaw--reply-of (list :messages (list (list :role "user" :content " 2+2? ") final))
+                                             "k2" "2+2?")
+                   "4"))))
+
+(ert-deftest lispm-openclaw-test-deliver ()
+  "Another agent's message goes to the Gateway as the session's user's next
+message, kept for after its run under way; an older Gateway, knowing no
+queueMode, is given it without."
+  (lispm-openclaw-test-with-gateway
+      '(("chat.send" . (:runId "k" :status "started")))
+    (lispm-openclaw-test-with-terminal "agent:main:lispm:a1"
+      (should (eq (lispm-openclaw--deliver terminal "[Message from codex]\nHi.") t))
+      (lispm-openclaw-test--wait (lambda () (params "chat.send")))
+      (let ((sent (car (params "chat.send"))))
+        (should (equal (plist-get sent :sessionKey) "agent:main:lispm:a1"))
+        (should (equal (plist-get sent :message) "[Message from codex]\nHi."))
+        (should (equal (plist-get sent :queueMode) "followup"))
+        (should (stringp (plist-get sent :idempotencyKey))))))
+  (lispm-openclaw-test-with-gateway
+      '(("chat.send" . (:json (:ok :false :error (:message "invalid chat.send params: at root: unexpected property 'queueMode'"))
+                        :status 1))
+        ("chat.send.2" . (:runId "k" :status "started")))
+    (lispm-openclaw-test-with-terminal "agent:main:lispm:a1"
+      (lispm-openclaw--deliver terminal "Hi.")
+      (lispm-openclaw-test--wait (lambda () (= (length (params "chat.send")) 2)))
+      (should (plist-member (nth 0 (params "chat.send")) :queueMode))
+      (should-not (plist-member (nth 1 (params "chat.send")) :queueMode))
+      (should (equal (plist-get (nth 0 (params "chat.send")) :idempotencyKey)
+                     (plist-get (nth 1 (params "chat.send")) :idempotencyKey))))))
+
+(ert-deftest lispm-openclaw-test-answer-request ()
+  "A session served no tools answers a request with its final reply to it,
+looked for in its history till it is there."
+  (lispm-openclaw-test-with-gateway
+      '(("chat.send" . (:runId "k" :status "started")))
+    (lispm-openclaw-test-with-terminal "agent:main:lispm:a1"
+      (let ((lispm-openclaw-answer-interval 0.05)
+            (answered nil))
+        (lispm-openclaw--answer-request terminal "2+2?" (lambda (reply) (setq answered reply)))
+        (lispm-openclaw-test--wait (lambda () (params "chat.send")))
+        (let ((id (plist-get (car (params "chat.send")) :idempotencyKey)))
+          (lispm-openclaw-test--answer
+           fake-directory "chat.history"
+           (list :messages (vector (list :role "user" :content "2+2?" :idempotencyKey (concat id ":user")))))
+          (lispm-openclaw-test--wait (lambda () (params "chat.history")))
+          (should-not answered)
+          (lispm-openclaw-test--answer
+           fake-directory "chat.history"
+           (list :messages (vector (list :role "user" :content "2+2?" :idempotencyKey (concat id ":user"))
+                                   (list :role "assistant" :stopReason "stop" :content "4")))))
+        (lispm-openclaw-test--wait (lambda () answered))
+        (should (equal answered "4"))
+        (should (equal (plist-get (car (params "chat.history")) :sessionKey) "agent:main:lispm:a1"))))))
+
+(ert-deftest lispm-openclaw-test-context ()
+  "While LispM runs, a session in a terminal is a peer: with LispM's tools
+through a server of its own in a Gateway here, on for it alone and gone
+with it; else, as with a Gateway elsewhere or one that cannot, with none."
+  (skip-unless (fboundp 'lispm-agents-context-presence-make))
+  (lispm-openclaw-test-with-gateway
+      '(("sessions.patch" . (:ok t)))
+    (let ((lispm-openclaw--served nil)
+          (lispm-openclaw--swept nil))
+      (cl-letf (((symbol-function 'lispm-openclaw--messaging-p) #'ignore))
+        (should-not (lispm-openclaw--context state "agent:main:lispm:a1")))
+      (cl-letf (((symbol-function 'lispm-openclaw--messaging-p) #'always))
+        (should-not (lispm-openclaw--context state))
+        ;; A Gateway elsewhere.
+        (with-temp-file (expand-file-name "config-get.out" fake-directory) (insert "remote\n"))
+        (should (lispm-agents-context-presence-p (lispm-openclaw--context state "agent:main:lispm:a1")))
+        (should-not (params "sessions.patch"))
+        ;; A Gateway here.
+        (with-temp-file (expand-file-name "config-get.out" fake-directory) (insert "local\n"))
+        (with-temp-file (expand-file-name "mcp-list.out" fake-directory)
+          (insert "{\"lispm_0123456789\": {\"enabled\": false}, \"docs\": {\"command\": \"x\"}}\n"))
+        (let* ((server (lispm-openclaw--context state "agent:main:lispm:a1"))
+               (name (lispm-openclaw--server-name server))
+               (set (seq-find (lambda (call) (string-prefix-p "mcp set " call)) (calls))))
+          (should (lispm-openclaw-mcp-p server))
+          ;; One left by an Emacs no longer running goes; others stay.
+          (should (member "mcp unset lispm_0123456789" (calls)))
+          (should-not (seq-find (lambda (call) (string-search "unset docs" call)) (calls)))
+          (should (string-prefix-p (format "mcp set %s {" name) set))
+          (let ((config (lispm-openclaw--json (substring set (+ 9 (length name))))))
+            (should (equal (plist-get config :url)
+                           (format "http://127.0.0.1:%d/mcp" (lispm-agents-mcp-port server))))
+            (should (equal (plist-get config :transport) "streamable-http"))
+            (should (equal (plist-get (plist-get config :headers) :Authorization)
+                           (concat "Bearer " (lispm-agents-mcp-token server))))
+            (should (plist-member config :enabled))
+            (should-not (plist-get config :enabled)))
+          (should (equal (car (params "sessions.patch"))
+                         (list :key "agent:main:lispm:a1"
+                               :toolOverrides (list :mcpServers (list (intern (concat ":" name)) t)))))
+          (lispm-agents-context-stop server)
+          (should-not lispm-openclaw--served)
+          (lispm-openclaw-test--wait (lambda () (member (concat "mcp unset " name) (calls))))
+          (should (member (concat "mcp unset " name) (calls))))
+        ;; A Gateway that cannot turn a server on for one session.
+        (lispm-openclaw-test--answer
+         fake-directory "sessions.patch"
+         '(:json (:ok :false :error (:message "invalid sessions.patch params: at root: unexpected property 'toolOverrides'"))
+                 :status 1))
+        (cl-letf (((symbol-function 'message) #'ignore))
+          (should (lispm-agents-context-presence-p (lispm-openclaw--context state "agent:main:lispm:a2"))))
+        (let ((names (delq nil (mapcar (lambda (call) (and (string-match "\\`mcp set \\([^ ]+\\)" call)
+                                                            (match-string 1 call)))
+                                       (calls)))))
+          (should (member (concat "mcp unset " (car (last names))) (calls))))
+        (should-not lispm-openclaw--served)))))
 
 (provide 'lispm-openclaw-test)
 ;;; lispm-openclaw-test.el ends here

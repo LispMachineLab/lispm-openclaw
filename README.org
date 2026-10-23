@@ -33,11 +33,27 @@ its terminal UI, its web UI and its chat channels share.  While ~openclaw~ is on
 - ~lispm-agents-send-region~ (=C-c a r=) puts the region, with where it is, into the input of a
   running OpenClaw terminal.
 
-OpenClaw takes MCP servers for its agents in the Gateway alone, not per session, so it sees
-nothing of Emacs's state.
-
 Without ~openclaw~ on ~PATH~, OpenClaw shows nowhere, and LispM Desktop's App Store greys it out
 with the command installing it.
+
+* With the other agents
+
+While LispM runs (lispm-agent 0.8.0 or later), an OpenClaw session open in a terminal works with
+the other agents, LispM's own and other programs' such as Claude Code and Codex:
+
+- What they send it, =[Message from codex]= or =[Request R1 from claude]=, goes to the Gateway
+  as the session's next message, kept for after the run under way (~chat.send~ with
+  =queueMode= =followup=; an older Gateway keeps it so by itself).  The terminal UI shows it.
+- With a Gateway on this computer, the session gets LispM's tools, ~list_agents~,
+  ~send_message~, ~ask_agent~, ~reply~, ~search_tools~, ~skill~ and ~call_tool~: a server of its
+  own among the Gateway's MCP servers (~openclaw mcp set lispm_…~), off but for that session,
+  and taken away again with the terminal.  A call of a LispM tool that changes things waits for
+  your approval in Emacs.
+- With a Gateway elsewhere, which cannot reach Emacs, or one too old to turn a server on for one
+  session, the session gets no tools; it still takes messages, and its final reply to a request
+  is its answer.
+
+OpenClaw sees nothing else of Emacs's state.
 
 * Installation
 
