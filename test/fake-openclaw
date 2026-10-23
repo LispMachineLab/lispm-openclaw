@@ -1,0 +1,24 @@
+#!/bin/sh
+# Copyright (C) 2026  Ryan.K
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# A stand-in for openclaw, for lispm-openclaw's tests: it keeps the
+# arguments of every call in $FAKE_OPENCLAW_DIR/calls, one call a line.
+# Called as `openclaw gateway call METHOD ...', it writes what
+# $FAKE_OPENCLAW_DIR/METHOD.err holds to its error output and what
+# METHOD.json holds to its output, and exits with the status in
+# METHOD.status, else 0.  A second answer, METHOD.2.json, with
+# METHOD.2.status, is given from the second call of METHOD on.
+dir=${FAKE_OPENCLAW_DIR:?}
+printf '%s\n' "$*" >> "$dir/calls"
+if [ "$1 $2" = "gateway call" ]; then
+  method=$3
+  if [ -e "$dir/$method.called" ] && [ -e "$dir/$method.2.json" ]; then
+    method="$method.2"
+  fi
+  touch "$dir/$3.called"
+  [ -e "$dir/$method.err" ] && cat "$dir/$method.err" >&2
+  [ -e "$dir/$method.json" ] && cat "$dir/$method.json"
+  exit "$(cat "$dir/$method.status" 2>/dev/null || echo 0)"
+fi
+echo "openclaw $*"
