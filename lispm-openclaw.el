@@ -57,8 +57,20 @@
 ;;   deleting one has the Gateway delete it with its transcript.  A
 ;;   session's transcript is its conversation, in Markdown.
 ;;
-;; OpenClaw takes MCP servers for its agents in the Gateway alone, not
-;; per session, so it sees nothing of Emacs's state.
+;; While LispM runs, OpenClaw talks with the other agents, LispM's and
+;; other programs' such as Claude Code (lispm-agents-bridge.el):
+;;
+;; - What another agent sends a session goes to the Gateway as its user's
+;;   next message, after the run under way if there is one.  OpenClaw's
+;;   terminal UI shows it.
+;; - A Gateway on this computer gives the session LispM's tools: a server
+;;   of the session's own, in the Gateway's MCP servers (`openclaw mcp
+;;   set'), off but for that session.  It goes with the terminal.
+;; - A Gateway elsewhere cannot reach Emacs, and an older one cannot give
+;;   a session a server of its own: such a session gets no tools, and its
+;;   final reply to a request answers it.
+;;
+;; OpenClaw sees nothing else of Emacs's state.
 
 ;;; Code:
 
@@ -67,6 +79,10 @@
 (require 'subr-x)
 (require 'project)
 (require 'lispm-agents)
+(require 'lispm-agents-mcp)
+
+;; Since lispm-agent 0.8.0: servers serving nothing.
+(declare-function lispm-agents-context-presence-make "lispm-agents-context")
 
 (defgroup lispm-openclaw nil
   "OpenClaw, one of the editor's agents."
@@ -576,6 +592,208 @@ a chat."
   "Return the arguments opening OpenClaw's terminal UI on the session KEY."
   (list "tui" "--session" key))
 
+;;;; Other agents' messages, and LispM's tools
+
+(defconst lispm-openclaw-answer-interval 3
+  "Seconds between looks at whether a session answered a request.")
+
+(defconst lispm-openclaw-answer-timeout (* 6 3600)
+  "Seconds a session has to answer a request.")
+
+(cl-defstruct (lispm-openclaw-mcp (:include lispm-agents-mcp)
+                                  (:constructor lispm-openclaw-mcp--make))
+  "The server of an OpenClaw terminal, which its session reaches as one of
+the Gateway's MCP servers.")
+
+(defvar lispm-openclaw--served nil
+  "Live servers of OpenClaw terminals, as (SERVER NAME KEY): NAME is the
+server's in the Gateway's config, KEY the session's.")
+
+(defvar lispm-openclaw--swept nil
+  "Non-nil once servers an Emacs no longer running left in the Gateway's
+config were taken away.")
+
+(defun lispm-openclaw--messaging-p ()
+  "Return non-nil when LispM serves the editor's agents its tools and
+messages, and LispM Agent can make a peer of an agent it serves none."
+  (and (featurep 'lispm-agents-bridge) (fboundp 'lispm-agents-context-presence-make)))
+
+(defun lispm-openclaw--command (&rest args)
+  "Run OpenClaw with ARGS; return its output, or signal
+`lispm-openclaw-refused' with what it said when it fails."
+  (let ((errors (make-temp-file "lispm-openclaw"))
+        (coding-system-for-read 'utf-8))
+    (unwind-protect
+        (with-temp-buffer
+          (let ((status (apply #'call-process lispm-openclaw-program nil (list t errors) nil args)))
+            (unless (eq status 0)
+              (signal 'lispm-openclaw-refused
+                      (list (lispm-openclaw--said (concat (with-temp-buffer (insert-file-contents errors)
+                                                                            (buffer-string))
+                                                          "\n" (buffer-string))))))
+            (buffer-string)))
+      (delete-file errors))))
+
+(defun lispm-openclaw--local-p ()
+  "Return non-nil when OpenClaw's Gateway runs on this computer, as its
+config here says, and so can reach Emacs."
+  (equal (string-trim (or (ignore-errors (lispm-openclaw--command "config" "get" "gateway.mode")) ""))
+         "local"))
+
+(defun lispm-openclaw--server-name (server)
+  "Return the name SERVER has among the Gateway's MCP servers."
+  (concat "lispm_" (substring (md5 (lispm-agents-mcp-token server)) 0 10)))
+
+(defun lispm-openclaw--server-config (server)
+  "Return the Gateway's config of SERVER, off unless a session turns it on."
+  (list :url (format "http://127.0.0.1:%d/mcp" (lispm-agents-mcp-port server))
+        :transport "streamable-http"
+        :headers (list :Authorization (concat "Bearer " (lispm-agents-mcp-token server)))
+        :enabled :false))
+
+(defun lispm-openclaw--sweep ()
+  "Take from the Gateway's config the servers of terminals no Emacs runs
+any more, as one that stopped without taking its own away leaves them;
+once in an Emacs."
+  (unless lispm-openclaw--swept
+    (setq lispm-openclaw--swept t)
+    (when-let* ((servers (ignore-errors
+                           (lispm-openclaw--json (lispm-openclaw--command "mcp" "list" "--json")))))
+      (cl-loop for (field _) on servers by #'cddr
+               for name = (substring (symbol-name field) 1)
+               when (and (string-prefix-p "lispm_" name)
+                         (not (seq-find (lambda (entry) (equal (nth 1 entry) name)) lispm-openclaw--served)))
+               do (ignore-errors (lispm-openclaw--command "mcp" "unset" name))))))
+
+(defun lispm-openclaw--serve (directory key)
+  "Serve LispM's tools to the session KEY, opened in a terminal in
+DIRECTORY: a server of its own among the Gateway's MCP servers, on for
+KEY alone.  Return it, or nil when the Gateway runs elsewhere or cannot
+turn a server on for one session, as an older one."
+  (when (lispm-openclaw--local-p)
+    (lispm-openclaw--sweep)
+    (let* ((server (lispm-agents-mcp-start "openclaw-mcp" #'lispm-openclaw-mcp--make directory))
+           (name (lispm-openclaw--server-name server)))
+      (condition-case err
+          (progn
+            (lispm-openclaw--command "mcp" "set" name
+                                     (lispm-openclaw--encode (lispm-openclaw--server-config server)))
+            (lispm-openclaw--call "sessions.patch"
+                                  (list :key key
+                                        :toolOverrides (list :mcpServers (list (intern (concat ":" name)) t))))
+            (push (list server name key) lispm-openclaw--served)
+            server)
+        (error
+         (ignore-errors (lispm-openclaw--command "mcp" "unset" name))
+         (lispm-agents-context-stop server)
+         (message "OpenClaw's session gets no tools of LispM's: %s" (lispm-openclaw--error-message err))
+         nil)))))
+
+(cl-defmethod lispm-agents-context-stop ((server lispm-openclaw-mcp))
+  "Stop SERVER, and take it from the Gateway's config, in the background."
+  (when-let* ((entry (assq server lispm-openclaw--served)))
+    (setq lispm-openclaw--served (delq entry lispm-openclaw--served))
+    (make-process :name "lispm-openclaw unset" :noquery t :connection-type 'pipe
+                  :buffer nil :sentinel #'ignore
+                  :command (list lispm-openclaw-program "mcp" "unset" (nth 1 entry))))
+  (cl-call-next-method))
+
+(defun lispm-openclaw--context (directory &optional key)
+  "Make the session KEY, opened in a terminal in DIRECTORY, a peer of the
+other agents while LispM runs: with LispM's tools when the Gateway can
+give them, else with a server serving nothing."
+  (when (and key (lispm-openclaw--messaging-p))
+    (or (lispm-openclaw--serve directory key)
+        (lispm-agents-context-presence-make))))
+
+(defun lispm-openclaw--terminal-key (terminal)
+  "Return the key of the session of TERMINAL; an error if unknown."
+  (or (lispm-agents-terminal-session-id terminal)
+      (error "%s runs no OpenClaw session known yet" (buffer-name terminal))))
+
+(defun lispm-openclaw--send (key text callback)
+  "Give the session KEY TEXT as its user's next message, in the background:
+after its run under way, if any.  CALLBACK is called with the message's
+idempotency key and nil, or with nil and the error, as (SYMBOL . DATA)."
+  (let* ((id (lispm-openclaw--uuid))
+         (params (list :sessionKey key :message text :idempotencyKey id)))
+    (lispm-openclaw--call-async
+     "chat.send" (append params (list :queueMode "followup"))
+     (lambda (answer err)
+       (if (and err (string-search "queueMode" (format "%s" (cdr err))))
+           ;; An older Gateway knows no queueMode: it keeps a message for
+           ;; after the run under way by itself.
+           (lispm-openclaw--call-async "chat.send" params
+                                       (lambda (answer err) (funcall callback (and answer id) err)))
+         (funcall callback (and answer id) err))))))
+
+(defun lispm-openclaw--deliver (terminal text)
+  "Give the session of TERMINAL TEXT as its user's next message, which the
+Gateway keeps until the session is free.  Return t; should the Gateway
+refuse it, that is said."
+  (lispm-openclaw--send (lispm-openclaw--terminal-key terminal) text
+                        (lambda (_id err)
+                          (when err
+                            (message "OpenClaw did not take a message of another agent's: %s"
+                                     (lispm-openclaw--error-message err)))))
+  t)
+
+(defun lispm-openclaw--sent-p (message id text)
+  "Return non-nil when MESSAGE, as the Gateway gives a conversation's, is
+the user's message sent with the idempotency key ID, or, of a Gateway
+keeping no keys, the user's message TEXT."
+  (and (equal (plist-get message :role) "user")
+       (or (equal (plist-get message :idempotencyKey) (concat id ":user"))
+           (equal (plist-get (plist-get message :__openclaw) :idempotencyKey) (concat id ":user"))
+           (equal (lispm-openclaw--message-text message) (string-trim text)))))
+
+(defun lispm-openclaw--reply-of (answer id text)
+  "Return the final reply, in ANSWER, the Gateway's chat.history, to the
+message TEXT sent with the idempotency key ID, or nil while there is
+none: the first answer after it that ends a run, as one calling no tools
+does."
+  (when-let* ((after (cdr (seq-drop-while (lambda (message) (not (lispm-openclaw--sent-p message id text)))
+                                          (plist-get answer :messages))))
+              (final (seq-find (lambda (message)
+                                 (and (equal (plist-get message :role) "assistant")
+                                      (member (plist-get message :stopReason) '("stop" "end_turn" "length"))
+                                      (lispm-openclaw--message-text message)))
+                               after)))
+    (lispm-openclaw--message-text final)))
+
+(defun lispm-openclaw--await-reply (terminal key id text callback deadline)
+  "Look, every `lispm-openclaw-answer-interval' seconds until DEADLINE,
+whether the session KEY of TERMINAL has given its final reply to TEXT,
+sent with the idempotency key ID; call CALLBACK with it once it has.
+Looking stops with the terminal, whose end settles what it was asked."
+  (cond ((not (lispm-agents-terminal-live-p terminal)))
+        ((> (float-time) deadline)
+         (funcall callback (format "OpenClaw gave no reply in %d hours." (/ lispm-openclaw-answer-timeout 3600))))
+        (t
+         (run-at-time
+          lispm-openclaw-answer-interval nil
+          (lambda ()
+            (lispm-openclaw--call-async
+             "chat.history" (list :sessionKey key :limit 100)
+             (lambda (answer _err)
+               (if-let* ((reply (and answer (lispm-openclaw--reply-of answer id text))))
+                   (funcall callback reply)
+                 (lispm-openclaw--await-reply terminal key id text callback deadline)))))))))
+
+(defun lispm-openclaw--answer-request (terminal text callback)
+  "Give the session of TERMINAL TEXT, a request, as its user's next
+message, and call CALLBACK with its final reply to it, which answers the
+request: for a session served no tools to reply with."
+  (let ((key (lispm-openclaw--terminal-key terminal)))
+    (lispm-openclaw--send
+     key text
+     (lambda (id err)
+       (if err
+           (funcall callback (format "OpenClaw did not take the request: %s"
+                                     (lispm-openclaw--error-message err)))
+         (lispm-openclaw--await-reply terminal key id text callback
+                                      (+ (float-time) lispm-openclaw-answer-timeout)))))))
+
 (defun lispm-openclaw-setup ()
   "Set OpenClaw up, in a terminal: `openclaw onboard' asks for a model
 provider and its credentials, and sets the Gateway up as a service of
@@ -610,7 +828,10 @@ this computer, or names one elsewhere."
  :transcript #'lispm-openclaw--transcript
  :short-id #'lispm-openclaw--short-id
  :new-arguments #'lispm-openclaw--new-arguments
- :resume-arguments #'lispm-openclaw--resume-arguments)
+ :resume-arguments #'lispm-openclaw--resume-arguments
+ :context #'lispm-openclaw--context
+ :deliver #'lispm-openclaw--deliver
+ :answer #'lispm-openclaw--answer-request)
 
 (lispm-agents-add-session-reader 'openclaw #'lispm-openclaw--read-sessions)
 (add-hook 'lispm-agents-reread-sessions-hook #'lispm-openclaw--reread)

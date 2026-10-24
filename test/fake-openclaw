@@ -8,7 +8,11 @@
 # $FAKE_OPENCLAW_DIR/METHOD.err holds to its error output and what
 # METHOD.json holds to its output, and exits with the status in
 # METHOD.status, else 0.  A second answer, METHOD.2.json, with
-# METHOD.2.status, is given from the second call of METHOD on.
+# METHOD.2.status, is given from the second call of METHOD on.  Called
+# otherwise, as `openclaw config get ...', it prints what
+# $FAKE_OPENCLAW_DIR/config-get.out holds, named after its first two
+# arguments, and exits with the status in config-get.status, else 0; with
+# no such file it prints its arguments.
 dir=${FAKE_OPENCLAW_DIR:?}
 printf '%s\n' "$*" >> "$dir/calls"
 if [ "$1 $2" = "gateway call" ]; then
@@ -20,5 +24,10 @@ if [ "$1 $2" = "gateway call" ]; then
   [ -e "$dir/$method.err" ] && cat "$dir/$method.err" >&2
   [ -e "$dir/$method.json" ] && cat "$dir/$method.json"
   exit "$(cat "$dir/$method.status" 2>/dev/null || echo 0)"
+fi
+command="$1-$2"
+if [ -e "$dir/$command.out" ]; then
+  cat "$dir/$command.out"
+  exit "$(cat "$dir/$command.status" 2>/dev/null || echo 0)"
 fi
 echo "openclaw $*"
