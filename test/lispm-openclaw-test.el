@@ -642,5 +642,14 @@ with it; else, as with a Gateway elsewhere or one that cannot, with none."
           (should (member (concat "mcp unset " (car (last names))) (calls))))
         (should-not lispm-openclaw--served)))))
 
+(ert-deftest lispm-openclaw-test-knows-no-desktop ()
+  "OpenClaw's extension stands alone beside lispm-agent: none of its files
+but the tests names LispM Desktop's code."
+  (dolist (file (directory-files (file-name-directory (locate-library "lispm-openclaw")) t "\\.el\\'"))
+    (with-temp-buffer
+      (insert-file-contents file)
+      (should-not (and (re-search-forward "lispm-desktop\\|platinum" nil t)
+                       (format "%s:%d" (file-name-nondirectory file) (line-number-at-pos)))))))
+
 (provide 'lispm-openclaw-test)
 ;;; lispm-openclaw-test.el ends here
