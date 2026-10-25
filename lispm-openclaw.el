@@ -35,6 +35,12 @@
 ;; takes part while `openclaw' is on PATH: k in `lispm-agents-map' starts
 ;; it in the current project, and its sessions join the others.
 ;;
+;; It needs lispm-agent 0.8.0 or later (the package `lispm'), which LispM
+;; Desktop loads before it.  Package-Requires leaves it out on purpose:
+;; package.el would not activate this package where lispm-agent is a
+;; checkout on the load path rather than a package, or a package of an
+;; older version, and it could not be loaded at all.
+;;
 ;; OpenClaw keeps its conversations in its Gateway, a service on this
 ;; computer or on another, which every way of talking to OpenClaw, its
 ;; terminal UI, its web UI and its chat channels, shares.  So:
